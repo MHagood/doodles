@@ -1,0 +1,128 @@
+# Consistent AIO logging approach (terminal + disk).  Runs on host or your workstation.  Much is Python native.  
+#       dox: https://docs.python.org/3/library/logging.handlers.html
+#
+# logs to /host/path/here
+# your log dir:      ../<solution_name>[/<splunk_idx>]/<log_filename>.log
+# example:           ../new_process_name/new_process.log   <-- no index required for default index=phantom
+# NOTE: workstation runs log to your execution directory, ignore above subdirs
+#
+#
+import inspect, os, logging, pytz, sys, time
+import logging.config
+from datetime import datetime, timezone, timedelta
+from logging.handlers import RotatingFileHandler
+#   dox: https://docs.python.org/3/library/logging.handlers.html#logging.handlers.RotatingFileHandler
+ 
+# override Python's logging.Formatter in certain places for custom formatting
+class _Formatter(logging.Formatter): # create using (existing class) as template
+	""" disabled, no need to override constructor..
+	def __init__(self, *args, **kwargs):
+		super().__init__(*args, **kwargs) # pass-thru original __init__ function within logging.Formatter, preserves functionality"""
+	   
+	def converter(self, timestamp):
+		""" net new, converts time into datetime agnostically """
+		dt = datetime.fromtimestamp(timestamp) # assume UTC
+		return dt.astimezone(pytz.utc) # unmodified, no tz conversion.  NOTE: if we called .normalize() it'd convert to local EST
+	   
+	def formatTime(self, record, datefmt=None):
+		""" overridden """
+		dt = self.converter(record.created) # record.created = time.time() at call, AKA epoch timestamp
+		if datefmt:
+			out = dt.strftime(datefmt)
+			#return super().formatTime(record, datefmt) # defer to existing code
+		else:
+			try:
+				out = dt.isoformat(timespec="milliseconds")
+			except TypeError:
+				out = dt.isoformat()
+		return out[:-3] # strip last 3 microseconds...3 millisecond places is fine
+   
+	def formatMessage(self, record):
+		""" overridden, special rules for default logging.INFO level """
+		if record.levelno == logging.INFO: # special formatting for 'normal' messages
+			self._style._fmt = INFO_LOG_FORMAT
+		else: # all others
+			self._style._fmt = GLOBAL_LOG_FORMAT
+ 
+		# original code
+		return self._style.format(record)
+	# .. rest of logging.Formatter as-is
+ 
+INFO_LOG_FORMAT = "{asctime}Z | {module:>25s} | {message}" # no levelname
+GLOBAL_LOG_FORMAT = "{asctime}Z | {module:>25s} | {levelname:^8s} | {message}"
+GLOBAL_LOG_FORMATTER = _Formatter(GLOBAL_LOG_FORMAT, datefmt="%Y-%m-%dT%H:%M:%S.%f", style="{") # UTC ISO time [| log level ]| msg
+#   dox: https://docs.python.org/3/library/logging.html#logrecord-attributes
+ 
+class My_Logging():
+	def __init__(self, log_filename, solution_name="no_name_solution", spl_index_name=None):
+		""" solution_name + spl_index_name used only for file-based logging subdir creation """
+		__fs_file__ = __file__.replace(os.sep, '/') # force forward slash, WIN + *nix <3
+		self.exec_file = __fs_file__[__fs_file__.rindex("/")+1:]
+		self.exec_dir = os.path.dirname(os.path.realpath(__fs_file__)).replace(os.sep, '/')
+		self.exec_dir_name = self.exec_dir[self.exec_dir.rindex("/")+1:]
+		self.root_log_dir = /host/path/here" # if present
+ 
+		if not log_filename or len(log_filename) == 0: # param structure allows ambiguous single param approach for the uninitiated coming from logging
+			log_filename = "no_name.log"
+		if ".py" in log_filename[-3:]:
+			log_filename = log_filename.replace(".py", ".log")
+		if ".log" not in log_filename[-4:]: # force .log suffix
+			log_filename = "{}.log".format(log_filename)
+		self.log_filename = log_filename
+		self.solution_name = solution_name
+		self.spl_index_name = spl_index_name if spl_index_name else ""
+ 
+		# determine full_log_dir (root)
+		if os.path.exists(self.root_log_dir): # host run
+			self.full_log_dir = os.path.join(self.root_log_dir, self.solution_name, self.spl_index_name).replace(os.sep, '/')
+			if not os.path.exists(self.full_log_dir):
+				print("Creating host dir: '{}'".format(self.full_log_dir))
+				os.makedirs(self.full_log_dir, exist_ok=True) # make sure these exist
+			self.full_log_path = os.path.join(self.full_log_dir, self.log_filename).replace(os.sep, '/')
+		else: # workstation run, default to execution dir
+			cwd = os.getcwd()
+			self.full_log_path = os.path.join(cwd, self.log_filename).replace(os.sep, '/')
+			# print("WARNING  | Workstation run, ignoring subdirs, logging to exec dir: '{}'".format(self.full_log_path))#, log_level=logging.WARNING)
+ 
+		# root AKA default log settings
+		self.py_log = logging.getLogger() # <- no param
+		self.py_log.setLevel(logging.INFO) # DEBUG, INFO, WARNING, ERROR, CRITICAL.  Py-default = WARNING or higher
+	   
+		file_handler = RotatingFileHandler(self.full_log_path, backupCount=4, mode="a")
+		if os.path.exists(self.full_log_path):
+			file_handler.doRollover() # rotate last log into .1, .2, ..to maintain run history
+		file_handler.setFormatter(GLOBAL_LOG_FORMATTER)
+		self.py_log.addHandler(file_handler)
+	   
+		# also handle STDOUT + STDERR, AKA 2-in-1 log/print functionality
+		#   NOTE: assign formatter the same on these handlers or they'll appear differently 👀
+		stderr_handler = logging.StreamHandler(sys.stderr)
+		stderr_handler.setFormatter(GLOBAL_LOG_FORMATTER)
+		self.py_log.addHandler(stderr_handler) # stderr incorporates stdout
+		sys.excepthook = self.handle_uncaught_exception # handle unhandled exceptions
+	   
+	def getLogger(self):
+		""" overrides Python's logging.getLogger, hence camelCase """
+		return self.py_log # verbatim
+   
+	def handle_uncaught_exception(self, ex_type, ex_value, ex_trace): # inspiration from: https://stackoverflow.com/a/16993115
+		""" override sys.excepthook to provide uncaught exception handling <3 """
+		if issubclass(ex_type, KeyboardInterrupt):
+			sys.__excepthook__(ex_type, ex_value, ex_trace)
+			return
+		self.py_log.critical("Uncaught exception", exc_info=(ex_type, ex_value, ex_trace))
+		   
+# below IS NOT part of Logger class..
+def v_print(*args, **kwargs):
+	""" use me to print with similar formatting\ninstantiation not required, import + call """
+	# __file__ = __file__.replace("\\", "/")
+	caller_file = inspect.stack()[1].filename.replace("\\", "/")
+	caller_filename = caller_file[caller_file.rindex("/")+1:]
+	utc_now = "{}Z".format(datetime.now(timezone.utc).isoformat()[0:-9]) # TZ-aware UTC as ISO-8601 AKA YYYY-MM-DDTHH:MM:SS.sssZ
+	args = ("{} | {} | {}".format(utc_now, caller_filename.rjust(25), x) for x in args) # modify arguments
+	print(*args, **kwargs) # pass onward to native print()
+ 
+if __name__ == "__main__":
+	logger = My_Logging("logging_demo").getLogger() if not logging.getLogger().hasHandlers() else logging.getLogger() # create or continue log
+	logger.info("hello bud") # default severity log message
+	logger.log(logging.INFO, "hello bud, AGAIN")    # functionally identical to above.  Python's logging.info() wraps logging.log()
